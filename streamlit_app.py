@@ -4,6 +4,11 @@ import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 
+# Force 'Close' to be a clean DataFrame
+data = yf.download(tickers, period="5y")['Close']
+if isinstance(data, pd.Series): # If only one ticker is provided
+    data = data.to_frame()
+
 # --- App Config ---
 st.set_page_config(page_title="Indian Portfolio Monte Carlo", layout="wide")
 st.title("🇮🇳 Indian Market Portfolio Simulator")
