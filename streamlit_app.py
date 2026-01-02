@@ -1,3 +1,4 @@
+!pip install streamlit
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -10,14 +11,14 @@ st.set_page_config(page_title="Monte Carlo Portfolio Simulator", layout="wide")
 st.title("📊 Monte Carlo Portfolio Simulator")
 st.markdown("""
 This tool simulates future portfolio performance using **Geometric Brownian Motion (GBM)**.
-It calculates **Value at Risk (VaR)** and projects potential price paths based on historical volatility and correlations.
+It automatically cleans data and handles overlapping historical periods.
 """)
 
 # --- Sidebar: User Inputs ---
 st.sidebar.header("Configuration")
 
-default_tickers = "SPY, TLT, GLD"
-default_weights = "0.5, 0.3, 0.2"
+default_tickers = "SPY, TLT, GLD, BTC-USD"
+default_weights = "0.4, 0.3, 0.2, 0.1"
 
 ticker_input = st.sidebar.text_input("Enter Tickers (comma separated)", default_tickers)
 weights_input = st.sidebar.text_input("Enter Weights (comma separated)", default_weights)
@@ -32,115 +33,104 @@ def process_inputs(ticker_str, weight_str):
     try:
         weights = np.array([float(w) for w in weight_str.split(",")])
     except ValueError:
-        st.error("Check your weights format. Use numbers separated by commas.")
         return None, None
-    
+
     if len(tickers) != len(weights):
-        st.error(f"Error: You provided {len(tickers)} tickers but {len(weights)} weights.")
+        st.error(f"Error: {len(tickers)} tickers vs {len(weights)} weights.")
         return None, None
-    
-    if not np.isclose(sum(weights), 1.0):
-        st.warning(f"Note: Weights sum to {sum(weights):.2f}. Normalizing to 1.0.")
-        weights = weights / np.sum(weights)
-        
+
     return tickers, weights
 
 # --- Main Execution ---
 if st.sidebar.button("Run Simulation"):
     tickers, weights = process_inputs(ticker_input, weights_input)
-    
+
     if tickers and weights is not None:
-        with st.spinner('Fetching market data and running simulations...'):
+        with st.spinner('Fetching and aligning market data...'):
             try:
                 # 1. Fetch Data
-                # Fetching 5 years to ensure we have enough data for correlations
                 raw_data = yf.download(tickers, period="5y")['Close']
-                
-                # --- DATA CLEANING (Crucial to prevent [nan, nan] error) ---
-                # 1. Drop assets that are entirely NaN
-                data = raw_data.dropna(axis=1, how='all')
-                # 2. Fill small gaps and drop rows where any asset is missing (ensures alignment)
-                data = data.ffill().dropna()
-                
-                if data.empty or data.shape[1] < len(tickers):
-                    st.error("Error: Some tickers have no overlapping history or were not found.")
+
+                # Handle single-ticker edge case
+                if isinstance(raw_data, pd.Series):
+                    raw_data = raw_data.to_frame()
+
+                # 2. Robust Data Cleaning (Fixes the [nan, nan] and "No Overlap" errors)
+                # Drop tickers that are entirely NaN
+                found_tickers = raw_data.columns[~raw_data.isnull().all()].tolist()
+                missing = list(set(tickers) - set(found_tickers))
+
+                if missing:
+                    st.warning(f"Skipping (No Data found): {', '.join(missing)}")
+
+                # Filter data to only found tickers and drop rows with ANY NaNs to ensure overlap
+                data = raw_data[found_tickers].dropna()
+
+                if data.empty or len(data) < 30:
+                    st.error("Error: Not enough overlapping historical data. Try older tickers or a shorter timeframe.")
                     st.stop()
 
-                # 2. Calculate Statistics
-                # Using log returns for GBM: ln(Price_t / Price_t-1)
+                # Re-align weights based on surviving tickers
+                indices_to_keep = [tickers.index(t) for t in found_tickers]
+                final_weights = weights[indices_to_keep]
+                final_weights = final_weights / np.sum(final_weights) # Normalize to 1.0
+
+                # 3. Calculate Statistics
                 log_returns = np.log(data / data.shift(1)).dropna()
-                
                 mean_returns = log_returns.mean().to_numpy()
                 std_devs = log_returns.std().to_numpy()
                 corr_matrix = log_returns.corr().to_numpy()
-                
-                # 3. Cholesky Decomposition
-                # Adding a tiny epsilon to the diagonal ensures the matrix is positive-definite
-                L = np.linalg.cholesky(corr_matrix + 1e-8 * np.eye(len(tickers)))
-                
-                # 4. Run Simulation Loop
+
+                # 4. Cholesky Decomposition (with stability epsilon)
+                L = np.linalg.cholesky(corr_matrix + 1e-8 * np.eye(len(found_tickers)))
+
+                # 5. Run Simulation
                 days = 252 * years
-                num_assets = len(tickers)
+                num_assets = len(found_tickers)
                 portfolio_sims = np.zeros((days, simulations))
-                
                 current_prices = data.iloc[-1].to_numpy()
 
-                # Optimized Simulation using Vectorization
                 for m in range(simulations):
-                    # Generate correlated random variables
-                    Z_uncorrelated = np.random.normal(0, 1, (days, num_assets))
-                    Z_correlated = np.dot(L, Z_uncorrelated.T).T 
-                    
-                    # Geometric Brownian Motion formula
+                    Z = np.random.normal(0, 1, (days, num_assets))
+                    Z_corr = np.dot(L, Z.T).T
+
                     drift = mean_returns - 0.5 * std_devs**2
-                    diffusion = std_devs * Z_correlated
-                    
-                    # Calculate cumulative returns for each asset
+                    diffusion = std_devs * Z_corr
+
+                    # Compute price paths
                     daily_returns = np.exp(drift + diffusion)
                     path_multipliers = np.vstack([np.ones(num_assets), daily_returns]).cumprod(axis=0)
-                    
-                    # Calculate asset paths ($)
                     asset_paths = current_prices * path_multipliers[1:]
-                    
-                    # Calculate Portfolio Value for this path
-                    shares = (initial_investment * weights) / current_prices
+
+                    # Portfolio value calculation
+                    shares = (initial_investment * final_weights) / current_prices
                     portfolio_sims[:, m] = np.dot(asset_paths, shares)
 
-                # --- Visualization Section ---
+                # --- Results UI ---
+                st.success(f"Successfully simulated using {len(found_tickers)} assets over {len(data)} overlapping days.")
+
                 final_values = portfolio_sims[-1, :]
                 expected_val = np.mean(final_values)
                 var_95 = np.percentile(final_values, 5)
-                return_pct = ((expected_val - initial_investment) / initial_investment) * 100
-                
-                st.subheader("Results Summary")
+
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Expected Portfolio Value", f"${expected_val:,.2f}", f"{return_pct:.1f}%")
-                col2.metric("Value at Risk (95%)", f"${var_95:,.2f}", delta_color="inverse", help="5% chance the value falls below this number.")
-                col3.metric("Worst Case Scenario", f"${np.min(final_values):,.2f}", delta_color="inverse")
+                col1.metric("Expected Value", f"${expected_val:,.2f}")
+                col2.metric("VaR (95%)", f"${var_95:,.2f}", delta_color="inverse")
+                col3.metric("Max Drawdown (Sim)", f"${(np.min(final_values) - initial_investment):,.2f}", delta_color="inverse")
 
-                chart_col1, chart_col2 = st.columns(2)
-
-                with chart_col1:
-                    st.subheader(f"Projected Paths")
-                    fig, ax = plt.subplots(figsize=(10, 5))
-                    ax.plot(portfolio_sims, linewidth=1, alpha=0.05, color='#1f77b4') 
-                    ax.set_xlabel("Trading Days")
-                    ax.set_ylabel("Portfolio Value ($)")
-                    ax.grid(True, alpha=0.2)
+                # Charts
+                c1, c2 = st.columns(2)
+                with c1:
+                    fig, ax = plt.subplots()
+                    ax.plot(portfolio_sims, color='royalblue', alpha=0.05)
+                    ax.set_title("Projected Portfolio Paths")
                     st.pyplot(fig)
-
-                with chart_col2:
-                    st.subheader("Probability Distribution")
-                    fig2, ax2 = plt.subplots(figsize=(10, 5))
-                    ax2.hist(final_values, bins=50, color='skyblue', edgecolor='white', alpha=0.8)
-                    ax2.axvline(expected_val, color='red', linestyle='--', label=f"Mean")
-                    ax2.axvline(var_95, color='orange', linestyle='--', label=f"VaR 95%")
-                    ax2.set_xlabel("Final Portfolio Value ($)")
-                    ax2.set_ylabel("Frequency")
-                    ax2.legend()
+                with c2:
+                    fig2, ax2 = plt.subplots()
+                    ax2.hist(final_values, bins=50, color='teal', alpha=0.7)
+                    ax2.axvline(var_95, color='orange', label="VaR 95%")
+                    ax2.set_title("Distribution of Final Outcomes")
                     st.pyplot(fig2)
 
             except Exception as e:
-                st.error(f"Simulation Error: {e}")
-                st.info("Try checking if your tickers have overlapping historical data.")
-                
+                st.error(f"Critical Simulation Error: {e}")
